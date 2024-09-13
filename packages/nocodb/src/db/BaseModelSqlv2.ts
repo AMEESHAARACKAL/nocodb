@@ -77,6 +77,7 @@ import { defaultLimitConfig } from '~/helpers/extractLimitAndOffset';
 import generateLookupSelectQuery from '~/db/generateLookupSelectQuery';
 import { getAliasGenerator } from '~/utils';
 import applyAggregation from '~/db/aggregation';
+import { chunkArray } from '~/utils/tsUtils';
 
 dayjs.extend(utc);
 
@@ -5258,6 +5259,7 @@ class BaseModelSqlv2 {
       insertOneByOneAsFallback = false,
       isSingleRecordInsertion = false,
       allowSystemColumn = false,
+      trx = null,
     }: {
       chunkSize?: number;
       cookie?: any;
@@ -5267,9 +5269,10 @@ class BaseModelSqlv2 {
       insertOneByOneAsFallback?: boolean;
       isSingleRecordInsertion?: boolean;
       allowSystemColumn?: boolean;
+      trx?: any;
     } = {},
   ) {
-    let trx;
+    let transaction;
     try {
       // TODO: ag column handling for raw bulk insert
       const insertDatas = raw ? datas : [];
@@ -5465,19 +5468,19 @@ class BaseModelSqlv2 {
       // refer : https://www.sqlite.org/limits.html
       const chunkSize = this.isSqlite ? 10 : _chunkSize;
 
-      trx = await this.dbDriver.transaction();
+      transaction = trx ?? (await this.dbDriver.transaction());
 
       if (!foreign_key_checks) {
         if (this.isPg) {
-          await trx.raw('set session_replication_role to replica;');
+          await transaction.raw('set session_replication_role to replica;');
         } else if (this.isMySQL) {
-          await trx.raw('SET foreign_key_checks = 0;');
+          await transaction.raw('SET foreign_key_checks = 0;');
         }
       }
 
       await this.runOps(
         preInsertOps.map((f) => f()),
-        trx,
+        transaction,
       );
 
       let responses;
@@ -5488,7 +5491,7 @@ class BaseModelSqlv2 {
         responses = [];
 
         for (const insertData of insertDatas) {
-          const query = trx(this.tnPath).insert(insertData);
+          const query = transaction(this.tnPath).insert(insertData);
           let id = (await query)[0];
 
           if (agPkCol) {
@@ -5514,17 +5517,21 @@ class BaseModelSqlv2 {
 
         responses =
           !raw && (this.isPg || this.isMssql)
-            ? await trx
+            ? await transaction
                 .batchInsert(this.tnPath, insertDatas, chunkSize)
                 .returning(this.model.primaryKeys?.length ? returningObj : '*')
-            : await trx.batchInsert(this.tnPath, insertDatas, chunkSize);
+            : await transaction.batchInsert(
+                this.tnPath,
+                insertDatas,
+                chunkSize,
+              );
       }
 
       if (!foreign_key_checks) {
         if (this.isPg) {
-          await trx.raw('set session_replication_role to origin;');
+          await transaction.raw('set session_replication_role to origin;');
         } else if (this.isMySQL) {
-          await trx.raw('SET foreign_key_checks = 1;');
+          await transaction.raw('SET foreign_key_checks = 1;');
         }
       }
 
@@ -5547,7 +5554,9 @@ class BaseModelSqlv2 {
         );
       }
 
-      await trx.commit();
+      if (!trx) {
+        await transaction.commit();
+      }
 
       if (!raw && !skip_hooks) {
         if (isSingleRecordInsertion) {
@@ -5560,8 +5569,91 @@ class BaseModelSqlv2 {
 
       return responses;
     } catch (e) {
-      await trx?.rollback();
+      await transaction?.rollback();
       // await this.errorInsertb(e, data, null);
+      throw e;
+    }
+  }
+
+  async bulkUpsert(
+    datas: {
+      insert: Record<string, any>[];
+      update: Record<string, any>[];
+    },
+    {
+      chunkSize = 100,
+      cookie,
+      raw = false,
+      throwExceptionIfNotExist = false,
+      foreign_key_checks = true,
+      skip_hooks = false,
+    }: {
+      chunkSize?: number;
+      cookie?: any;
+      raw?: boolean;
+      throwExceptionIfNotExist?: boolean;
+      foreign_key_checks?: boolean;
+      skip_hooks?: boolean;
+    } = {},
+  ) {
+    let trx;
+    try {
+      await this.model.getColumns(this.context);
+      const primaryKeys = this.model.primaryKeys;
+
+      const { insert: toInsert, update: toUpdate } = datas;
+
+      trx = await this.dbDriver.transaction();
+
+      let updatedRecords = [];
+      let insertedRecords = [];
+
+      // Perform bulk update
+      if (toUpdate.length > 0) {
+        updatedRecords = await this.bulkUpdate(toUpdate, {
+          cookie,
+          raw,
+          throwExceptionIfNotExist,
+          isSingleRecordUpdation: false,
+          trx,
+        });
+      }
+
+      // Perform bulk insert
+      if (toInsert.length > 0) {
+        insertedRecords = await this.bulkInsert(toInsert, {
+          chunkSize,
+          cookie,
+          foreign_key_checks,
+          skip_hooks,
+          raw,
+          trx,
+        });
+      }
+
+      await trx.commit();
+
+      const upsertedData = [...updatedRecords, ...insertedRecords];
+
+      // If raw data was used, we need to fetch the complete records
+      const allPkValues = upsertedData
+        .map((data) =>
+          getCompositePkValue(primaryKeys, this.extractPksValues(data)),
+        )
+        .filter(Boolean);
+
+      const fetchedRecords = [];
+      for (const pkChunk of chunkArray(allPkValues, chunkSize)) {
+        const records = await this.list(
+          { pks: pkChunk.join(',') },
+          { limitOverride: pkChunk.length },
+        );
+        fetchedRecords.push(...records);
+      }
+
+      return fetchedRecords;
+    } catch (e) {
+      if (trx) await trx.rollback();
       throw e;
     }
   }
@@ -5573,11 +5665,13 @@ class BaseModelSqlv2 {
       raw = false,
       throwExceptionIfNotExist = false,
       isSingleRecordUpdation = false,
+      trx = null,
     }: {
       cookie?: any;
       raw?: boolean;
       throwExceptionIfNotExist?: boolean;
       isSingleRecordUpdation?: boolean;
+      trx?: any;
     } = {},
   ) {
     let transaction;
@@ -5690,13 +5784,15 @@ class BaseModelSqlv2 {
         }
       }
 
-      transaction = await this.dbDriver.transaction();
+      transaction = trx ?? (await this.dbDriver.transaction());
 
       for (const o of toBeUpdated) {
         await transaction(this.tnPath).update(o.d).where(o.wherePk);
       }
 
-      await transaction.commit();
+      if (!trx) {
+        await transaction.commit();
+      }
 
       if (!raw) {
         while (updatePkValues.length) {
@@ -10182,9 +10278,15 @@ export function _wherePk(
   return where;
 }
 
-export function getCompositePkValue(primaryKeys: Column[], row) {
+export function getCompositePkValue(
+  primaryKeys: Column[],
+  row,
+  throwError = true,
+) {
   if (row === null || row === undefined) {
-    NcError.requiredFieldMissing(primaryKeys.map((c) => c.title).join(','));
+    if (throwError)
+      NcError.requiredFieldMissing(primaryKeys.map((c) => c.title).join(','));
+    return null;
   }
 
   if (typeof row !== 'object') return row;

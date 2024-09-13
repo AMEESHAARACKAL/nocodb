@@ -268,6 +268,8 @@ export function useViewData(
     bulkUpdateView,
     selectedAllRecords,
     removeRowIfNew,
+    bulkInsertRows,
+    bulkUpsertRows,
   } = useData({
     meta,
     viewMeta,
@@ -407,5 +409,7 @@ export function useViewData(
     optimisedQuery,
     islastRow,
     isFirstRow,
+    bulkInsertRows,
+    bulkUpsertRows,
   }
 }
