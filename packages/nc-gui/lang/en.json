@@ -623,6 +623,7 @@
     "categories": "Categories"
   },
   "labels": {
+    "continue": "Continue",
     "modifiedOn": "Modified on",
     "configuration": "Configuration",
     "setup": "Setup",
